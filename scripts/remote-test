@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# 在 GPU 机上为当前 worktree 运行 pytest，见 docs/Development_Workflow.md 第 8 节。
+#
+#   scripts/remote-test [--gpus N] [pytest 参数]
+#   scripts/remote-test --status [--gpus N]   # 跑门槛集合并给 HEAD 写 gpu-tests 状态
+set -euo pipefail
+
+host=${ODYSSEY_TEST_HOST:-sgtm-ssh-four-20261003-92513389-cfcd2.jincheng1.ailab-safewt.pod@h.pjlab.org.cn}
+gpu_count=8
+
+# GPU 机侧：按需独占 GPU，隔离临时目录后运行 pytest。
+if [[ ${1-} == __on-host ]]; then
+  worktree=$2 venv=$3 gpus=$4
+  shift 4
+  cd "$worktree"
+
+  # 每张卡一个锁文件，fd 由 pytest 继承，持有到测试结束；卡不够时全部释放后等待。
+  ((gpus <= gpu_count)) || { echo "最多 $gpu_count 张 GPU" >&2; exit 1; }
+  picked=() fds=()
+  if ((gpus > 0)); then
+    mkdir -p /tmp/odyssey-gpu-locks
+    while :; do
+      for ((i = 0; i < gpu_count && ${#picked[@]} < gpus; i++)); do
+        exec {fd}>"/tmp/odyssey-gpu-locks/$i"
+        if flock -n "$fd"; then picked+=("$i") fds+=("$fd"); else exec {fd}>&-; fi
+      done
+      ((${#picked[@]} == gpus)) && break
+      for fd in "${fds[@]}"; do exec {fd}>&-; done
+      picked=() fds=()
+      echo "等待 $gpus 张空闲 GPU..." >&2
+      sleep 10
+    done
+  fi
+
+  run_tmp=$(mktemp -d /tmp/odyssey-test.XXXXXX)
+  trap 'rm -rf "$run_tmp"' EXIT
+  export CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${picked[*]}")
+  export ODYSSEY_TEST_TMPDIR=$run_tmp TMPDIR=$run_tmp RAY_TMPDIR=$run_tmp
+  export PYTHONPATH="$worktree/src${PYTHONPATH:+:$PYTHONPATH}"
+  "$venv/bin/python" -m pytest "$@"
+  exit
+fi
+
+gpus=0 status=0 args=()
+while (($#)); do
+  case $1 in
+    --gpus) gpus=$2; shift 2 ;;
+    --status) status=1; shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+worktree=$(git rev-parse --show-toplevel)
+main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+venv=$worktree/.venv
+[[ -d $venv ]] || venv=$main_root/.venv
+[[ -x $venv/bin/python ]] || { echo "找不到 venv：$venv" >&2; exit 1; }
+
+if ((status)); then
+  [[ -z $(git status --porcelain) ]] || { echo "--status 要求工作区干净" >&2; exit 1; }
+  [[ $(git rev-parse HEAD) == $(git rev-parse '@{u}' 2>/dev/null) ]] \
+    || { echo "--status 要求 HEAD 已推送" >&2; exit 1; }
+  args=(tests/contracts tests/numerics)
+  if git diff --name-only origin/main...HEAD | grep -q '^src/odyssey/backends/'; then
+    args+=(tests/backend)
+  fi
+fi
+
+sha=$(git rev-parse HEAD)
+mkdir -p "$main_root/.test-logs"
+log=.test-logs/$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD).log
+
+set +e
+ssh -o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes "$host" \
+  "$(printf '%q ' bash "$worktree/scripts/remote-test" __on-host "$worktree" "$venv" "$gpus" "${args[@]}")" \
+  2>&1 | tee "$main_root/$log"
+code=${PIPESTATUS[0]}
+set -e
+
+if ((status)); then
+  summary=$(grep -E '^=+ .* in [0-9.]+s' "$main_root/$log" | tail -1 | sed -E 's/^=+ | =+$//g')
+  state=$( ((code == 0)) && echo success || echo failure)
+  gh api -X POST "repos/{owner}/{repo}/statuses/$sha" \
+    -f state="$state" -f context=gpu-tests \
+    -f description="${summary:-exit $code}; $log" >/dev/null
+  echo "gpu-tests: $state ($sha)"
+fi
+exit "$code"
